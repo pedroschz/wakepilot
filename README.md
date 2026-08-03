@@ -38,6 +38,8 @@ Lid closed, display off, `claude remote-control` running. Zero wake latency, zer
 
 The Mac sleeps for real. Every few minutes it wakes for a few seconds, checks a mailbox, and either goes straight back to sleep or stays up and hands you a session.
 
+**One minute is the floor, and it's already aggressive.** launchd's `StartCalendarInterval` has no seconds field — `Minute` is the finest grain there is — so sub-minute polling isn't buildable without abandoning launchd entirely. It also wouldn't help: a wake, a WiFi re-association, an HTTPS round trip and a sleep is on the order of ten to twenty seconds of not-being-asleep. At a 30-second cadence the machine is awake more than it's asleep, never reaches deep standby, and you've built Tier 0 with extra sleep/wake wear. If you want sub-minute responsiveness, you want Tier 0.
+
 The numbers below are **back-of-envelope, not measured** — treat them as shape, not truth, and measure your own machine with `pmset -g log`:
 
 | Mode | Rough cost |
@@ -116,7 +118,31 @@ curl -d "my-secret wake" ntfy.sh/my-topic
 
 Within `POLL_MINUTES` your phone buzzes with a tappable link into the live environment.
 
-**iOS Shortcut version:** *Get Contents of URL* → `https://ntfy.sh/<topic>` → POST → body `<secret> wake`. Name it "Wake the Mac" and it becomes a Siri phrase and a Lock Screen button.
+### Triggering it from your phone
+
+You need two things on the phone: something to **receive** the push, and something to **send** the wake command.
+
+**Receiving — the ntfy app.** Install [ntfy](https://ntfy.sh/) for [iOS](https://apps.apple.com/us/app/ntfy/id1625396347) or [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), subscribe to your topic, and that's it. Wake confirmations arrive as notifications you can tap straight through to the session.
+
+**Sending, option A — a Home Screen bookmark (30 seconds to set up).** ntfy accepts a plain GET, so a bookmark is enough:
+
+```
+https://ntfy.sh/<topic>/publish?message=<secret>%20wake
+```
+
+Open that in Safari → Share → *Add to Home Screen*. Now waking the Mac is one tap from your Home Screen, no app required. The catch: your secret sits in the URL, so it lands in browser history and in anything that syncs it. Fine for most people; use option B if that bothers you.
+
+**Sending, option B — an iOS Shortcut (the good one).**
+
+1. Shortcuts → **+** → *Add Action* → search **Get Contents of URL**
+2. URL: `https://ntfy.sh/<topic>`
+3. Tap the **⌄** to expand, set **Method: POST**
+4. **Request Body: Text**, and type `<secret> wake`
+5. Rename it **Wake the Mac**
+
+That name is now a Siri phrase — *"Hey Siri, Wake the Mac"* — and the shortcut can be pinned to the Home Screen, the Lock Screen, the Action Button, or a widget. Duplicate it with a body of `<secret> sleep` for the other direction.
+
+**Sending, option C — anything that can POST.** It's one HTTP request, so Apple Watch shortcuts, a Stream Deck, Tasker, a smart button, or a cron job on another machine all work the same way.
 
 ### Commands you can text it
 
