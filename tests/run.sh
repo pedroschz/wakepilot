@@ -476,6 +476,29 @@ test_remote_plist_is_valid_after_substitution() {
   assert_not_contains "$(cat "$out")" "__"
 }
 
+# Regression: scutil hands back whatever the user named their Mac. An "&" broke
+# the plist XML, and a bare "&" in a sed replacement expands to the whole match.
+test_remote_plist_survives_an_awkward_computer_name() {
+  local out="$SANDBOX/awkward.plist" name="Ana & Luis's <MacBook>"
+  xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+  sed_esc() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
+  subst()   { sed_esc "$(xml_esc "$1")"; }
+
+  sed -e "s|__CLAUDE_BIN__|$(subst /opt/homebrew/bin/claude)|g" \
+      -e "s|__PROJECT_DIR__|$(subst "/Users/demo/R&D")|g" \
+      -e "s|__HOME__|$(subst /Users/demo)|g" \
+      -e "s|__PATH__|$(subst /usr/bin:/bin)|g" \
+      -e "s|__SESSION_NAME__|$(subst "$name")|g" \
+      -e "s|__SPAWN_MODE__|$(subst worktree)|g" \
+      "$ROOT/launchd/com.wakepilot.remote.plist" > "$out"
+
+  assert_true lint_plist "$out"
+  assert_contains "$(cat "$out")" "Ana &amp; Luis's &lt;MacBook&gt;"
+  assert_contains "$(cat "$out")" "/Users/demo/R&amp;D"
+  # And it must survive the round trip back out of the plist.
+  assert_eq "$(plutil -extract ProgramArguments.3 raw -o - "$out")" "$name"
+}
+
 test_config_example_covers_every_documented_setting() {
   local key missing=""
   for key in NTFY_SERVER NTFY_TOPIC NTFY_TOKEN SHARED_SECRET POLL_MINUTES \
@@ -546,6 +569,7 @@ run "tick: ignores a bad secret"             tick_ignores_a_message_with_the_wro
 
 run "packaging: daemon plist"                daemon_plist_is_valid_after_substitution
 run "packaging: remote plist"                remote_plist_is_valid_after_substitution
+run "packaging: awkward computer name"       remote_plist_survives_an_awkward_computer_name
 run "packaging: config example"              config_example_covers_every_documented_setting
 run "packaging: scripts parse"               scripts_parse
 

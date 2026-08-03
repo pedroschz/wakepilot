@@ -114,14 +114,22 @@ launchctl bootstrap system /Library/LaunchDaemons/com.wakepilot.daemon.plist
 echo "   daemon loaded (ticks every ${POLL_MINUTES}min)"
 
 # --- agent (user) -------------------------------------------------------------
+# These values land inside XML *and* inside a sed replacement, so they need both
+# escapings. A computer name like "Ana & Luis's MacBook" — which scutil will
+# happily hand us — otherwise produces invalid plist XML, and a bare & in a sed
+# replacement expands to the whole match.
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+sed_esc() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
+subst()   { sed_esc "$(xml_esc "$1")"; }
+
 AGENT="$REAL_HOME/Library/LaunchAgents/com.wakepilot.remote.plist"
 install -d -m 755 -o "$REAL_USER" "$REAL_HOME/Library/LaunchAgents" "$REAL_HOME/Library/Logs"
-sed -e "s|__CLAUDE_BIN__|$CLAUDE_BIN|g" \
-    -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
-    -e "s|__HOME__|$REAL_HOME|g" \
-    -e "s|__PATH__|$USER_PATH|g" \
-    -e "s|__SESSION_NAME__|$SESSION_NAME|g" \
-    -e "s|__SPAWN_MODE__|$SPAWN_MODE|g" \
+sed -e "s|__CLAUDE_BIN__|$(subst "$CLAUDE_BIN")|g" \
+    -e "s|__PROJECT_DIR__|$(subst "$PROJECT_DIR")|g" \
+    -e "s|__HOME__|$(subst "$REAL_HOME")|g" \
+    -e "s|__PATH__|$(subst "$USER_PATH")|g" \
+    -e "s|__SESSION_NAME__|$(subst "$SESSION_NAME")|g" \
+    -e "s|__SPAWN_MODE__|$(subst "$SPAWN_MODE")|g" \
     "$SRC/launchd/com.wakepilot.remote.plist" > "$AGENT"
 chown "$REAL_USER" "$AGENT"; chmod 644 "$AGENT"
 plutil -lint "$AGENT" >/dev/null
