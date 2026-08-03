@@ -1,0 +1,21 @@
+#!/bin/bash
+# Fake curl. Serves canned ntfy JSON for polls and records publishes.
+url=""; body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) body="$2"; shift 2 ;;
+    -H) shift 2 ;;
+    --max-time) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+case "$url" in
+  *"/json?poll=1"*)
+    cat "$STUB_DIR/ntfy_messages" 2>/dev/null
+    exit "$(cat "$STUB_DIR/curl_rc" 2>/dev/null || echo 0)" ;;
+  *)
+    printf '%s\n' "$body" >> "$STUB_DIR/posts"
+    exit "$(cat "$STUB_DIR/curl_rc" 2>/dev/null || echo 0)" ;;
+esac

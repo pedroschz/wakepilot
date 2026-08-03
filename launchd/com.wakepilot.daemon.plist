@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs as root so it can call pmset. install.sh writes the real copy to
+  /Library/LaunchDaemons/, expanding the placeholder line below into one
+  <dict> per slot on the POLL_MINUTES grid.
+
+  Two halves make a wake work and you need both:
+    pmset schedule wake     tells the hardware to power on at a given moment
+    StartCalendarInterval   tells macOS to run this script at that moment
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wakepilot.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/wakepilot</string>
+        <string>tick</string>
+    </array>
+
+    <!-- Clears any leftover sleep-hold on every boot. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartCalendarInterval</key>
+    <array>
+__MINUTES__
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/wakepilot.daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/wakepilot.daemon.log</string>
+
+    <!-- Not Background: that class gets throttled, and a tick has ~15 seconds
+         of wake window to spend a network round trip in. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
+</dict>
+</plist>

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake ioreg: reports STUB_DIR/hid_idle seconds of user idle time.
+idle=$(cat "$STUB_DIR/hid_idle" 2>/dev/null || echo 3600)
+printf '    "HIDIdleTime" = %s000000000\n' "$idle"

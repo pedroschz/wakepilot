@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs as YOU, not root — Remote Control needs your claude.ai login from your
+  keychain and your ~/.claude config, and root must never hold those.
+
+  install.sh fills in the placeholders below: the claude binary, the project
+  directory, your home directory, your PATH, the session name and the spawn mode.
+
+  KeepAlive restarts the server when it exits, which it will after a long
+  network outage. Ordinary sleep is fine: Remote Control reconnects on wake.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wakepilot.remote</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLAUDE_BIN__</string>
+        <string>remote-control</string>
+        <string>--name</string>
+        <string>__SESSION_NAME__</string>
+        <string>--spawn</string>
+        <string>__SPAWN_MODE__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- Remote Control exits immediately when the workspace is untrusted or you
+         are signed out. 60s keeps that from becoming a hot restart loop. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/wakepilot-remote.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/wakepilot-remote.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

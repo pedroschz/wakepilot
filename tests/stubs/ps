@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake ps: STUB_DIR/claude_cpu is the CPU% attributed to claude processes.
+echo "%CPU COMMAND"
+printf '%s /opt/homebrew/bin/claude remote-control\n' "$(cat "$STUB_DIR/claude_cpu" 2>/dev/null || echo 0.0)"

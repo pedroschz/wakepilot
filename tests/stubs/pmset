@@ -1,0 +1,36 @@
+#!/bin/bash
+# Fake pmset. Deliberately mimics the real one's asymmetry: it *accepts* a
+# two-digit year and *prints* a four-digit one. That mismatch is what broke
+# schedule cancellation, so the tests must be able to reproduce it.
+SCHED="$STUB_DIR/sched"
+echo "pmset $*" >> "$STUB_DIR/calls"
+
+expand() {   # "08/02/26 14:00:00" -> "08/02/2026 14:00:00"
+  local d="${1%% *}" t="${1#* }" mm dd yy
+  mm="${d%%/*}"; yy="${d##*/}"; dd="${d#*/}"; dd="${dd%%/*}"
+  [ "${#yy}" -eq 2 ] && yy="20$yy"
+  printf '%s/%s/%s %s' "$mm" "$dd" "$yy" "$t"
+}
+
+case "${1:-}" in
+  -g)
+    case "${2:-}" in
+      batt)       cat "$STUB_DIR/batt" 2>/dev/null ;;
+      sched)      echo "Scheduled power events:"; cat "$SCHED" 2>/dev/null ;;
+      assertions) cat "$STUB_DIR/assertions" 2>/dev/null ;;
+      "")         echo " SleepDisabled          $(cat "$STUB_DIR/disablesleep" 2>/dev/null || echo 0)" ;;
+    esac ;;
+  -a)
+    [ "${2:-}" = "disablesleep" ] && echo "$3" > "$STUB_DIR/disablesleep" ;;
+  schedule)
+    if [ "${2:-}" = "cancel" ]; then
+      full=$(expand "$4")
+      grep -vF "$3 at $full by '${5:-}'" "$SCHED" > "$SCHED.tmp" 2>/dev/null
+      mv "$SCHED.tmp" "$SCHED" 2>/dev/null
+    else
+      full=$(expand "$3")
+      printf " [0]  %s at %s by '%s'\n" "$2" "$full" "${4:-}" >> "$SCHED"
+    fi ;;
+  sleepnow) echo "SLEEPNOW" >> "$STUB_DIR/calls" ;;
+esac
+exit 0

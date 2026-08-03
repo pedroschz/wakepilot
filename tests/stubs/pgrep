@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake pgrep: is remote-control "running"?
+[ -f "$STUB_DIR/remote_running" ] && { echo 4242; exit 0; }
+exit 1

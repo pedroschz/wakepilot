@@ -1,0 +1,41 @@
+# wakepilot config — installed to /usr/local/etc/wakepilot.conf (chmod 600, root:wheel)
+#
+# This file is sourced by a root shell script. Only put shell variable
+# assignments in it.
+
+# --- your mailbox -------------------------------------------------------------
+# ntfy.sh is free and needs no account. The topic name IS the password, so make
+# it long and random:  openssl rand -hex 16
+NTFY_SERVER="https://ntfy.sh"
+NTFY_TOPIC="wakepilot-CHANGEME-3f9a2c1b8d4e"
+NTFY_TOKEN=""                    # only if you self-host ntfy with auth
+
+# Second lock: every command must start with this word. Anyone who guesses your
+# topic still can't wake the Mac without it.  openssl rand -hex 12
+SHARED_SECRET="changeme-pick-something-random"
+
+# --- timing -------------------------------------------------------------------
+POLL_MINUTES=5                   # how often the Mac wakes to check the mailbox.
+                                 # Must divide 60. 5 = snappy, 15 = frugal.
+HOLD_MINUTES=45                  # stay awake this long after the last activity
+MAX_HOLD_MINUTES=180             # hard ceiling — never awake longer than this
+QUIET_HOURS="01:00-07:00"        # no wakes in this window ("" to disable).
+                                 # One wake is scheduled for the end of it.
+
+# --- safety rails -------------------------------------------------------------
+BATTERY_FLOOR=25                 # on battery, sleep immediately below this %
+BATTERY_SAVER_POLL_MINUTES=60    # below the floor, check in this rarely instead
+                                 # of not at all, so plugging in gets you back
+IDLE_GUARD_SECONDS=300           # if you touched the keyboard this recently,
+                                 # wakepilot keeps its hands off the machine
+RESPECT_OTHER_ASSERTIONS=1       # don't force sleep during someone else's build
+TICK_TIMEOUT_SECONDS=90          # a tick that hangs is killed and the hold freed
+
+# --- housekeeping -------------------------------------------------------------
+LOG_MAX_BYTES=1048576            # wakepilot.log is trimmed past this
+REMOTE_LOG_MAX_BYTES=2097152     # remote-control repaints its UI into its log
+                                 # continuously; without this it grows ~30 MB/day
+
+# --- identity -----------------------------------------------------------------
+CLAUDE_USER=""                   # leave blank to auto-detect the console user
+REMOTE_LOG=""                    # leave blank for ~/Library/Logs/wakepilot-remote.log

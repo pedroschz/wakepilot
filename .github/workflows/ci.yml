@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # pmset, launchd, ioreg and BSD date/stat are load bearing here.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Lint
+        run: shellcheck -s bash bin/wakepilot install.sh uninstall.sh tests/run.sh tests/stubs/*
+
+      # The plist templates hold placeholders, so they are linted after
+      # substitution inside the test suite rather than here.
+      - name: Test
+        run: ./tests/run.sh
+
+      - name: Check executables
+        run: |
+          for f in bin/wakepilot install.sh uninstall.sh tests/run.sh; do
+            test -x "$f" || { echo "$f is not executable"; exit 1; }
+          done

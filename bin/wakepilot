@@ -1,0 +1,760 @@
+#!/bin/bash
+# wakepilot — let a lid-closed MacBook sleep, wake it on demand, and hand you a
+# live Claude Code Remote Control session, then put it back to sleep.
+#
+#   tick            run every POLL_MINUTES by the LaunchDaemon (the whole brain)
+#   hold [minutes]  force the Mac awake for N minutes
+#   release         drop the hold and sleep now
+#   arm | disarm    enable/disable the whole system
+#   status          show what's going on
+#   selftest        end-to-end check of every moving part
+#   notify <msg>    push a message to your phone
+#   logs            tail the log
+#
+# Runs as root (LaunchDaemon) so it can call pmset. Claude Code itself runs as
+# you via a separate LaunchAgent — root must never hold your Claude credentials.
+#
+# Copyright (c) 2026 Pedro Sánchez-Gil. MIT licensed.
+
+set -uo pipefail
+
+WAKEPILOT_VERSION="1.0.0"
+
+CONF="${WAKEPILOT_CONF:-/usr/local/etc/wakepilot.conf}"
+STATE_DIR="${WAKEPILOT_STATE_DIR:-/usr/local/var/wakepilot}"
+LOG="${WAKEPILOT_LOG:-/usr/local/var/log/wakepilot.log}"
+
+# ---------------------------------------------------------------- defaults ---
+NTFY_SERVER="https://ntfy.sh"
+NTFY_TOPIC=""
+NTFY_TOKEN=""
+SHARED_SECRET=""
+POLL_MINUTES=5
+HOLD_MINUTES=45
+MAX_HOLD_MINUTES=180
+BATTERY_FLOOR=25
+BATTERY_SAVER_POLL_MINUTES=60   # below the floor, check in this rarely instead
+QUIET_HOURS=""                  # "01:00-07:00" — no scheduled wakes in this window
+CLAUDE_USER=""
+REMOTE_LOG=""                   # LaunchAgent stdout, scraped for the session URL
+IDLE_GUARD_SECONDS=300          # touched the keyboard this recently? hands off
+RESPECT_OTHER_ASSERTIONS=1      # don't force sleep during someone else's build
+WAKE_SLOTS=4                    # how many future wakes to keep queued
+TICK_TIMEOUT_SECONDS=90         # watchdog: a tick may never outlive this
+LOG_MAX_BYTES=1048576           # rotate our log past 1 MB
+REMOTE_LOG_MAX_BYTES=2097152    # remote-control repaints its TUI; cap it at 2 MB
+PMSET_OWNER="wakepilot"         # tag on our scheduled events; never cancel others'
+
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+mkdir -p "$STATE_DIR" "$(dirname "$LOG")" 2>/dev/null
+
+HOLD_FILE="$STATE_DIR/hold_until"
+START_FILE="$STATE_DIR/hold_started"
+ARM_FILE="$STATE_DIR/armed"
+CURSOR_FILE="$STATE_DIR/mailbox_cursor"
+SEEN_FILE="$STATE_DIR/mailbox_seen"
+URL_FILE="$STATE_DIR/session_url"
+LOWBATT_FILE="$STATE_DIR/low_battery_notified"
+LOCK_DIR="$STATE_DIR/tick.lock"
+
+: "${CLAUDE_USER:=$(stat -f%Su /dev/console 2>/dev/null)}"
+CLAUDE_HOME=$(dscl . -read "/Users/$CLAUDE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+: "${CLAUDE_HOME:=/Users/$CLAUDE_USER}"
+: "${REMOTE_LOG:=$CLAUDE_HOME/Library/Logs/wakepilot-remote.log}"
+
+now() { date +%s; }
+# Read a stored integer, or nothing if the file is missing or holds junk.
+# (Note the redirect order: `< missing 2>/dev/null` still prints to stderr,
+# because the input redirect is applied before stderr has been silenced.)
+read_int() { [ -f "$1" ] || return 0; tr -cd '0-9' < "$1"; }
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null; }
+say() { printf '%s\n' "$*"; }
+
+# ------------------------------------------------------------------ helpers ---
+
+battery_pct() { pmset -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+on_ac()       { pmset -g batt 2>/dev/null | grep -q "AC Power"; }
+is_root()     { [ "$(id -u)" -eq 0 ]; }
+
+# Seconds since the last keyboard/trackpad event.
+hid_idle_seconds() {
+  ioreg -c IOHIDSystem 2>/dev/null \
+    | awk '/HIDIdleTime/ {gsub(/[^0-9]/,"",$NF); if ($NF != "") {print int($NF/1000000000); exit}}'
+}
+
+# Is a human actually sitting at this machine? Then never force sleep.
+user_present() {
+  local idle
+  idle=$(hid_idle_seconds)
+  [ -n "$idle" ] && [ "$idle" -lt "$IDLE_GUARD_SECONDS" ]
+}
+
+# Another app (build, download, video call) holding the Mac awake?
+foreign_assertion() {
+  [ "$RESPECT_OTHER_ASSERTIONS" = "1" ] || return 1
+  pmset -g assertions 2>/dev/null \
+    | sed -n '/Listed by owning process/,$p' \
+    | grep -i 'PreventUserIdleSystemSleep' \
+    | grep -qiv 'caffeinate'
+}
+
+# Seconds since boot — used to spot hold state left over from a previous boot.
+# kern.boottime prints "{ sec = 1785725216, usec = 0 }". Anchor on the first
+# number: a greedy ".*sec = " happily matches the "usec" instead and returns 0.
+uptime_seconds() {
+  local b
+  b=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p')
+  if [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null; then
+    echo $(( $(now) - b ))
+  else
+    echo 999999999                  # unknown boot time: never call a hold stale
+  fi
+}
+
+# "HH:MM" today, rolled to tomorrow if it has already passed.
+next_time_epoch() {
+  local hhmm="$1" t
+  t=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-%d') ${hhmm}:00" '+%s' 2>/dev/null) || return 1
+  [ "$t" -le "$(now)" ] && t=$(( t + 86400 ))
+  echo "$t"
+}
+
+_hhmm_to_minutes() {
+  local v="$1"
+  echo $(( 10#${v%%:*} * 60 + 10#${v##*:} ))
+}
+
+# Optional argument is minutes-since-midnight, so the tests can pick a time.
+in_quiet_hours() {
+  [ -n "$QUIET_HOURS" ] || return 1
+  case "$QUIET_HOURS" in *-*) : ;; *) return 1 ;; esac
+  local start end nowm
+  start=$(_hhmm_to_minutes "${QUIET_HOURS%%-*}")
+  end=$(_hhmm_to_minutes "${QUIET_HOURS##*-}")
+  nowm="${1:-$(( 10#$(date '+%H') * 60 + 10#$(date '+%M') ))}"
+  if [ "$start" -le "$end" ]; then
+    [ "$nowm" -ge "$start" ] && [ "$nowm" -lt "$end" ]
+  else                                  # window crosses midnight
+    [ "$nowm" -ge "$start" ] || [ "$nowm" -lt "$end" ]
+  fi
+}
+
+armed() { [ -f "$ARM_FILE" ]; }
+
+# A hold file that survived a reboot is stale — the Mac is awake for some other
+# reason and we must not treat it as an active session.
+hold_until() {
+  local v=0
+  [ -f "$HOLD_FILE" ] && v=$(read_int "$HOLD_FILE")
+  [ -n "$v" ] || v=0
+  if [ "$v" -gt 0 ]; then
+    local started
+    started=$(read_int "$START_FILE")
+    if [ -n "$started" ] && [ "$started" -lt $(( $(now) - $(uptime_seconds) )) ]; then
+      log "discarding hold from before the last boot"
+      clear_hold
+      v=0
+    fi
+  fi
+  echo "$v"
+}
+
+clear_hold() { rm -f "$HOLD_FILE" "$START_FILE"; }
+
+begin_hold() {
+  local minutes="${1:-$HOLD_MINUTES}"
+  [ -f "$START_FILE" ] || now > "$START_FILE"
+  echo $(( $(now) + minutes * 60 )) > "$HOLD_FILE"
+}
+
+# ---------------------------------------------------------- log maintenance ---
+# remote-control repaints its TUI into the log a few times a second. Left alone
+# that is tens of megabytes a day, so keep only the tail of each log.
+
+trim_log() {
+  local f="$1" max="$2" keep tmp
+  [ -f "$f" ] || return 0
+  local size
+  size=$(stat -f%z "$f" 2>/dev/null) || return 0
+  [ "$size" -gt "$max" ] || return 0
+  keep=$(( max / 2 ))
+  tmp="${f}.trim.$$"
+  tail -c "$keep" "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  cat "$tmp" > "$f" 2>/dev/null       # truncate in place; keeps the open fd valid
+  rm -f "$tmp"
+}
+
+# ------------------------------------------------------------ notifications ---
+
+notify() {
+  local msg="$1" title="${2:-wakepilot}" click="${3:-}" prio="${4:-default}"
+  [ -n "$NTFY_TOPIC" ] || return 1
+  local args=(-fsS --max-time 15 -H "Title: $title" -H "Priority: $prio")
+  [ -n "$NTFY_TOKEN" ] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+  [ -n "$click" ] && args+=(-H "Click: $click")
+  curl "${args[@]}" -d "$msg" "$NTFY_SERVER/$NTFY_TOPIC" >/dev/null 2>&1
+}
+
+# The remote-control banner carries an environment deep link and, once a session
+# exists, a per-session link. Both arrive wrapped in ANSI and OSC-8 escapes.
+strip_ansi() {
+  sed -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' -e $'s/\x1b\\][0-9]*;;//g' -e $'s/\x07/ /g'
+}
+
+session_url() {
+  local u=""
+  if [ -f "$REMOTE_LOG" ]; then
+    local clean
+    clean=$(tail -c 65536 "$REMOTE_LOG" 2>/dev/null | strip_ansi)
+    u=$(printf '%s' "$clean" | grep -Eo 'https://claude\.ai/code\?environment=env_[A-Za-z0-9]+' | tail -1)
+    [ -n "$u" ] || u=$(printf '%s' "$clean" | grep -Eo 'https://claude\.ai/code/session_[A-Za-z0-9]+' | tail -1)
+  fi
+  if [ -n "$u" ]; then
+    printf '%s\n' "$u" > "$URL_FILE"
+  else
+    u=$(cat "$URL_FILE" 2>/dev/null)
+  fi
+  printf '%s\n' "${u:-https://claude.ai/code}"
+}
+
+# ---------------------------------------------------------------- mailbox ----
+# Poll ntfy for commands. Any message counts as activity; the body decides what
+# happens. Messages must be prefixed with SHARED_SECRET if one is configured.
+#
+# Swapping ntfy for a private repo, an S3 object or a Worker means rewriting
+# exactly this function — it just has to print one command per line.
+
+# Pull "time<TAB>id<TAB>message" out of ntfy's newline-delimited JSON without
+# needing jq or python. Handles backslash escapes; folds newlines to spaces.
+_ntfy_decode() {
+  awk '
+    function field(line, key,   p, i, c, n, out) {
+      p = index(line, "\"" key "\":\"")
+      if (p == 0) return ""
+      i = p + length(key) + 4
+      out = ""
+      while (i <= length(line)) {
+        c = substr(line, i, 1)
+        if (c == "\\") {
+          n = substr(line, i + 1, 1)
+          if (n == "n" || n == "t" || n == "r") out = out " "
+          else if (n == "u") { i += 4 }
+          else out = out n
+          i += 2
+          continue
+        }
+        if (c == "\"") break
+        out = out c
+        i++
+      }
+      return out
+    }
+    function num(line, key,   p, i, c, out) {
+      p = index(line, "\"" key "\":")
+      if (p == 0) return ""
+      i = p + length(key) + 3
+      out = ""
+      while (i <= length(line)) {
+        c = substr(line, i, 1)
+        if (c < "0" || c > "9") break
+        out = out c
+        i++
+      }
+      return out
+    }
+    index($0, "\"event\":\"message\"") > 0 {
+      t = num($0, "time"); id = field($0, "id"); m = field($0, "message")
+      if (id != "" && m != "") printf "%s\t%s\t%s\n", (t == "" ? 0 : t), id, m
+    }
+  '
+}
+
+poll_mailbox() {
+  [ -n "$NTFY_TOPIC" ] || return 0
+  local since
+  since=$(read_int "$CURSOR_FILE")
+  [ -n "$since" ] || since=$(( $(now) - 900 ))
+
+  local args=(-fsS --max-time 20)
+  [ -n "$NTFY_TOKEN" ] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+
+  local raw
+  raw=$(curl "${args[@]}" "$NTFY_SERVER/$NTFY_TOPIC/json?poll=1&since=$since" 2>/dev/null) || return 0
+  [ -n "$raw" ] || return 0
+
+  # Cursor by message timestamp + an id ledger, so a message that lands between
+  # the query and the bookkeeping is re-seen next tick rather than lost.
+  local newest="$since" line mtime mid body
+  while IFS=$'\t' read -r mtime mid body; do
+    [ -n "$mid" ] || continue
+    [ "$mtime" -gt "$newest" ] 2>/dev/null && newest="$mtime"
+    grep -qxF "$mid" "$SEEN_FILE" 2>/dev/null && continue
+    printf '%s\n' "$mid" >> "$SEEN_FILE"
+
+    if [ -n "$SHARED_SECRET" ]; then
+      case "$body" in
+        "$SHARED_SECRET "*) body="${body#"$SHARED_SECRET" }" ;;
+        "$SHARED_SECRET")   body="wake" ;;
+        *) log "rejected message (bad secret)"; continue ;;
+      esac
+    fi
+    printf '%s\n' "$body"
+  done <<EOF
+$(printf '%s\n' "$raw" | _ntfy_decode)
+EOF
+
+  echo "$newest" > "$CURSOR_FILE"
+  if [ -f "$SEEN_FILE" ]; then
+    tail -n 200 "$SEEN_FILE" > "$SEEN_FILE.tmp" && mv "$SEEN_FILE.tmp" "$SEEN_FILE"
+  fi
+}
+
+# ------------------------------------------------------------ power control ---
+
+set_disablesleep() { pmset -a disablesleep "$1" >/dev/null 2>&1; }
+
+sleep_disabled() { [ "$(pmset -g 2>/dev/null | awk '/SleepDisabled/ {print $2}')" = "1" ]; }
+
+# Which moments do we want the hardware to power on at?
+#   quiet hours  -> just once, when quiet hours end
+#   low battery  -> sparsely, so plugging in still gets you back
+#   otherwise    -> the next WAKE_SLOTS points on the POLL_MINUTES grid
+wake_schedule() {
+  local step i t
+  if in_quiet_hours; then
+    next_time_epoch "${QUIET_HOURS##*-}"
+    return 0
+  fi
+  local batt
+  batt=$(battery_pct)
+  if ! on_ac && [ -n "$batt" ] && [ "$batt" -lt "$BATTERY_FLOOR" ]; then
+    step=$(( BATTERY_SAVER_POLL_MINUTES * 60 ))
+  else
+    step=$(( POLL_MINUTES * 60 ))
+  fi
+  for i in $(seq 1 "$WAKE_SLOTS"); do
+    t=$(( ( $(now) / step + i ) * step ))
+    echo "$t"
+  done
+}
+
+# Cancel only the events we own. pmset prints a four-digit year but only accepts
+# a two-digit one, so convert on the way back in.
+clear_wakes() {
+  pmset -g sched 2>/dev/null \
+    | grep -iF "'$PMSET_OWNER'" \
+    | awk '{
+        for (i = 1; i < NF; i++) {
+          if ($i ~ /^[0-9]{1,2}\/[0-9]{1,2}\/[0-9]{2,4}$/ && $(i+1) ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/) {
+            n = split($i, d, "/")
+            y = d[3]; if (length(y) > 2) y = substr(y, length(y) - 1)
+            printf "%02d/%02d/%s %s\n", d[1], d[2], y, $(i+1)
+            break
+          }
+        }
+      }' \
+    | while IFS= read -r stamp; do
+        [ -n "$stamp" ] && pmset schedule cancel wake "$stamp" "$PMSET_OWNER" >/dev/null 2>&1
+      done
+}
+
+schedule_wakes() {
+  clear_wakes
+  local t stamp
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    stamp=$(date -r "$t" '+%m/%d/%y %H:%M:%S')
+    pmset schedule wake "$stamp" "$PMSET_OWNER" >/dev/null 2>&1
+  done <<EOF
+$(wake_schedule)
+EOF
+}
+
+go_to_sleep() {
+  log "sleeping (battery $(battery_pct)%)"
+  schedule_wakes                 # never sleep without a way back
+  TICK_GUARD_KEEP=0
+  set_disablesleep 0
+  clear_hold
+  sync
+  pmset sleepnow >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------- claude agent ---
+
+remote_running() { pgrep -f 'remote-control' >/dev/null 2>&1; }
+
+start_remote_agent() {
+  local uid
+  uid=$(id -u "$CLAUDE_USER" 2>/dev/null) || return 1
+  launchctl kickstart -k "gui/$uid/com.wakepilot.remote" >/dev/null 2>&1
+}
+
+# Rough activity signal: is a claude process actually burning CPU? pgrep can
+# match the process but not report its CPU share, so ps it is.
+claude_busy() {
+  local cpu
+  # shellcheck disable=SC2009
+  cpu=$(ps -Ao pcpu,command 2>/dev/null | grep -i '[c]laude' | awk '{s+=$1} END {print int(s)}')
+  [ -n "$cpu" ] && [ "$cpu" -gt 8 ]
+}
+
+# ----------------------------------------------------------------- the tick ---
+# Only one tick may run at a time, none may outlive TICK_TIMEOUT_SECONDS, and
+# whatever happens the machine must not be left awake by accident.
+
+TICK_GUARD_KEEP=0
+WATCHDOG_PID=""
+
+# Both of these are overridden by the test suite, which has no patience and no
+# real hardware. Keep them as thin as they look.
+pause() { sleep "$1"; }
+
+start_watchdog() {
+  ( sleep "$TICK_TIMEOUT_SECONDS"; kill -TERM $$ 2>/dev/null ) &
+  WATCHDOG_PID=$!
+}
+
+release_tick_guard() {
+  if [ "$TICK_GUARD_KEEP" = "1" ]; then
+    set_disablesleep 1
+  else
+    set_disablesleep 0
+  fi
+  [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null
+  rmdir "$LOCK_DIR" 2>/dev/null
+}
+
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local age
+    age=$(stat -f%m "$LOCK_DIR" 2>/dev/null)
+    if [ -n "$age" ] && [ $(( $(now) - age )) -gt $(( TICK_TIMEOUT_SECONDS * 2 )) ]; then
+      log "clearing a stale tick lock"
+      rmdir "$LOCK_DIR" 2>/dev/null
+      mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
+  return 0
+}
+
+do_tick() {
+  is_root || { say "wakepilot tick must run as root."; return 1; }
+  acquire_lock || { log "another tick is already running"; return 0; }
+
+  trap release_tick_guard EXIT INT TERM
+  start_watchdog
+
+  # Hold the wake window open while we work. If this script dies the trap drops
+  # it; if the whole machine wedges, the next tick or the next boot clears it.
+  set_disablesleep 1
+
+  trim_log "$LOG" "$LOG_MAX_BYTES"
+  trim_log "$REMOTE_LOG" "$REMOTE_LOG_MAX_BYTES"
+
+  if ! armed; then
+    clear_wakes
+    clear_hold
+    return 0
+  fi
+
+  local hold batt msg action="" hold_arg=""
+  hold=$(hold_until)
+
+  # ---- read the mailbox -----------------------------------------------------
+  while IFS= read -r msg; do
+    [ -z "$msg" ] && continue
+    log "message: $msg"
+    case "$(printf '%s' "$msg" | tr '[:upper:]' '[:lower:]')" in
+      sleep*|stop*|down*) action="sleep" ;;
+      status*|state*)     action="status" ;;
+      ping*)              action="ping" ;;
+      hold*)              action="wake"; hold_arg=$(printf '%s' "$msg" | tr -cd '0-9') ;;
+      *)                  action="wake" ;;
+    esac
+  done < <(poll_mailbox)
+
+  case "$action" in
+    sleep)
+      log "explicit sleep requested"
+      notify "Going to sleep. Send anything to wake me." "wakepilot"
+      go_to_sleep
+      return 0 ;;
+    ping)
+      notify "Awake. Battery $(battery_pct)%." "wakepilot" ;;
+    status)
+      notify "$(status_line)" "wakepilot" "$(session_url)" ;;
+    wake)
+      local mins="${hold_arg:-$HOLD_MINUTES}"
+      [ "$mins" -gt 0 ] 2>/dev/null || mins="$HOLD_MINUTES"
+      begin_hold "$mins"
+      TICK_GUARD_KEEP=1
+      remote_running || start_remote_agent
+      pause 5                                  # let the agent print its banner
+      log "holding awake until $(date -r "$(hold_until)" '+%H:%M')"
+      notify "Awake and listening. Battery $(battery_pct)%." \
+             "Mac is up" "$(session_url)" "high"
+      rm -f "$LOWBATT_FILE"
+      schedule_wakes
+      return 0 ;;
+  esac
+
+  # ---- battery floor: the one rule that overrides everything ----------------
+  batt=$(battery_pct)
+  if ! on_ac && [ -n "$batt" ] && [ "$batt" -lt "$BATTERY_FLOOR" ]; then
+    if [ ! -f "$LOWBATT_FILE" ]; then
+      notify "Battery down to ${batt}%. Sleeping and checking in hourly." "wakepilot" "" "high"
+      : > "$LOWBATT_FILE"
+    fi
+    log "battery floor hit ($batt%) — sleeping"
+    go_to_sleep
+    return 0
+  fi
+  rm -f "$LOWBATT_FILE"
+
+  # ---- quiet hours ----------------------------------------------------------
+  if in_quiet_hours && [ "$hold" -eq 0 ]; then
+    log "quiet hours — next wake at ${QUIET_HOURS##*-}"
+    user_present || go_to_sleep
+    return 0
+  fi
+
+  # ---- an active hold: decide whether to keep it ----------------------------
+  if [ "$hold" -gt 0 ]; then
+    local started
+    started=$(read_int "$START_FILE")
+    [ -n "$started" ] || started=$(now)
+
+    if [ $(( $(now) - started )) -gt $(( MAX_HOLD_MINUTES * 60 )) ]; then
+      log "max hold reached — sleeping"
+      notify "Hit the ${MAX_HOLD_MINUTES}min ceiling. Sleeping." "wakepilot"
+      go_to_sleep
+      return 0
+    fi
+
+    if claude_busy; then                       # extend while Claude is working
+      begin_hold "$HOLD_MINUTES"
+      TICK_GUARD_KEEP=1
+      log "claude busy — extending hold"
+      schedule_wakes
+      return 0
+    fi
+
+    if [ "$(now)" -ge "$hold" ]; then
+      log "hold expired — sleeping"
+      notify "Idle for ${HOLD_MINUTES}min. Sleeping." "wakepilot"
+      go_to_sleep
+      return 0
+    fi
+
+    TICK_GUARD_KEEP=1
+    remote_running || start_remote_agent
+    schedule_wakes
+    return 0
+  fi
+
+  # ---- nothing to do --------------------------------------------------------
+  if user_present;      then log "user present — standing down";        schedule_wakes; return 0; fi
+  if foreign_assertion; then log "another app holds sleep — standing down"; schedule_wakes; return 0; fi
+  go_to_sleep
+}
+
+# ---------------------------------------------------------------- reporting ---
+
+status_line() {
+  printf 'armed=%s hold=%s batt=%s%% remote=%s' \
+    "$(armed && echo yes || echo no)" \
+    "$([ "$(hold_until)" -gt 0 ] && date -r "$(hold_until)" '+%H:%M' || echo none)" \
+    "$(battery_pct)" \
+    "$(remote_running && echo up || echo down)"
+}
+
+cmd_status() {
+  local h
+  h=$(hold_until)
+  say "wakepilot $WAKEPILOT_VERSION"
+  say "armed:          $(armed && echo yes || echo no)"
+  say "hold until:     $([ "$h" -gt 0 ] && date -r "$h" '+%H:%M' || echo '—')"
+  say "battery:        $(battery_pct)%  $(on_ac && echo '(AC)' || echo '(battery)')"
+  say "lid-sleep off:  $(pmset -g 2>/dev/null | awk '/SleepDisabled/ {print $2}')"
+  say "remote-control: $(remote_running && echo running || echo stopped)"
+  say "session url:    $(session_url)"
+  say "user idle:      $(hid_idle_seconds)s"
+  say "quiet hours:    ${QUIET_HOURS:-off}$(in_quiet_hours && echo '  (now)')"
+  say "config:         $CONF"
+  say ""
+  say "scheduled wakes owned by wakepilot:"
+  pmset -g sched 2>/dev/null | grep -iF "'$PMSET_OWNER'" || say "  (none)"
+}
+
+# A real end-to-end check: publish to your own topic and read it back, then
+# start the agent and wait for Remote Control to actually say "Connected".
+cmd_selftest() {
+  local fails=0
+  step() { printf '%-28s' "$1"; }
+  ok()   { say "ok${1:+  $1}"; }
+  bad()  { say "FAIL${1:+  $1}"; fails=$(( fails + 1 )); }
+
+  step "config file"
+  if [ -f "$CONF" ]; then ok "$CONF"; else bad "missing $CONF"; fi
+
+  step "topic configured"
+  case "$NTFY_TOPIC" in
+    "")          bad "NTFY_TOPIC is empty" ;;
+    *CHANGEME*)  bad "NTFY_TOPIC is still the placeholder" ;;
+    *)           ok ;;
+  esac
+
+  step "secret configured"
+  case "$SHARED_SECRET" in
+    "")         say "warn  no SHARED_SECRET — anyone who learns your topic can wake this Mac" ;;
+    *changeme*) bad "SHARED_SECRET is still the placeholder" ;;
+    *)          ok ;;
+  esac
+
+  step "ntfy round trip"
+  if [ -n "$NTFY_TOPIC" ]; then
+    local probe start
+    probe="wakepilot-selftest-$$-$(now)"
+    start=$(( $(now) - 60 ))
+    if notify "$probe" "selftest"; then
+      sleep 2
+      local args=(-fsS --max-time 15)
+      [ -n "$NTFY_TOKEN" ] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+      if curl "${args[@]}" "$NTFY_SERVER/$NTFY_TOPIC/json?poll=1&since=$start" 2>/dev/null \
+           | _ntfy_decode | grep -qF "$probe"; then
+        ok "published and read back"
+      else
+        bad "published but could not read it back"
+      fi
+    else
+      bad "could not publish"
+    fi
+  else
+    bad "skipped, no topic"
+  fi
+
+  step "claude user"
+  if id "$CLAUDE_USER" >/dev/null 2>&1; then ok "$CLAUDE_USER"; else bad "unknown user '$CLAUDE_USER'"; fi
+
+  step "remote-control support"
+  local cbin
+  cbin=$(sudo -u "$CLAUDE_USER" -i bash -lc 'command -v claude' 2>/dev/null)
+  if [ -n "$cbin" ] && sudo -u "$CLAUDE_USER" -i bash -lc "$cbin remote-control --help" 2>/dev/null | grep -q 'Remote Control'; then
+    ok "$(sudo -u "$CLAUDE_USER" -i bash -lc "$cbin --version" 2>/dev/null | head -1)"
+  else
+    bad "'claude remote-control' unavailable — update Claude Code"
+  fi
+
+  # The one thing the test suite cannot check: that real pmset stores and
+  # honours the owner tag we cancel by. If it doesn't, wakes pile up forever,
+  # so prove it round trips on this machine rather than assuming.
+  step "pmset scheduling"
+  if is_root; then
+    local probe_t stamp
+    probe_t=$(( $(now) + 86400 ))
+    stamp=$(date -r "$probe_t" '+%m/%d/%y %H:%M:%S')
+    if ! pmset schedule wake "$stamp" "$PMSET_OWNER" >/dev/null 2>&1; then
+      bad "pmset schedule wake was rejected"
+    elif ! pmset -g sched | grep -qF "'$PMSET_OWNER'"; then
+      bad "pmset dropped the '$PMSET_OWNER' owner tag — cancellation cannot work"
+      pmset schedule cancel wake "$stamp" >/dev/null 2>&1
+    elif clear_wakes; pmset -g sched | grep -qF "'$PMSET_OWNER'"; then
+      bad "scheduled a wake but could not cancel it"
+    else
+      ok "schedule and cancel round trip"
+    fi
+  else
+    bad "not root — re-run with sudo"
+  fi
+
+  step "launchd daemon"
+  if launchctl print system/com.wakepilot.daemon >/dev/null 2>&1; then ok; else bad "not loaded"; fi
+
+  step "launchd agent"
+  local uid
+  uid=$(id -u "$CLAUDE_USER" 2>/dev/null)
+  if [ -n "$uid" ] && launchctl print "gui/$uid/com.wakepilot.remote" >/dev/null 2>&1; then ok; else bad "not loaded"; fi
+
+  step "remote control connects"
+  # Truncate rather than create: a root-owned log the agent can't write to
+  # would break the very thing we're testing.
+  [ -f "$REMOTE_LOG" ] && : > "$REMOTE_LOG"
+  chown "$CLAUDE_USER" "$REMOTE_LOG" 2>/dev/null
+  if start_remote_agent; then
+    local i=0 line=""
+    while [ "$i" -lt 30 ]; do
+      line=$(cat "$REMOTE_LOG" 2>/dev/null | strip_ansi)
+      case "$line" in
+        *Connected*)          ok "$(session_url)"; break ;;
+        *"not trusted"*)      bad "workspace not trusted — run 'claude' in the project dir once"; break ;;
+        *"only available"*|*"must be logged in"*) bad "not signed in to claude.ai — run 'claude /login'"; break ;;
+      esac
+      sleep 1
+      i=$(( i + 1 ))
+    done
+    [ "$i" -lt 30 ] || bad "no 'Connected' within 30s — see $REMOTE_LOG"
+  else
+    bad "could not start the agent"
+  fi
+
+  say ""
+  if [ "$fails" -eq 0 ]; then
+    say "All checks passed. 'sudo wakepilot arm' and close the lid."
+  else
+    say "$fails check(s) failed."
+  fi
+  return "$fails"
+}
+
+usage() {
+  say "wakepilot $WAKEPILOT_VERSION"
+  say "usage: wakepilot {tick|hold [min]|release|arm|disarm|status|selftest|notify <msg>|logs|version}"
+}
+
+main() {
+  case "${1:-status}" in
+    tick)    do_tick ;;
+    hold)
+      is_root || { say "Run with sudo."; exit 1; }
+      m="${2:-$HOLD_MINUTES}"
+      begin_hold "$m"
+      set_disablesleep 1
+      remote_running || start_remote_agent
+      schedule_wakes
+      say "Holding awake for ${m} minutes." ;;
+    release)
+      is_root || { say "Run with sudo."; exit 1; }
+      go_to_sleep; say "Released." ;;
+    arm)
+      is_root || { say "Run with sudo."; exit 1; }
+      case "$NTFY_TOPIC" in
+        ""|*CHANGEME*) say "Set NTFY_TOPIC in $CONF first."; exit 1 ;;
+      esac
+      case "$SHARED_SECRET" in
+        *changeme*) say "Set SHARED_SECRET in $CONF first."; exit 1 ;;
+      esac
+      touch "$ARM_FILE"; schedule_wakes
+      say "Armed. Waking every ${POLL_MINUTES}min to check in." ;;
+    disarm)
+      is_root || { say "Run with sudo."; exit 1; }
+      rm -f "$ARM_FILE"; clear_hold; clear_wakes; set_disablesleep 0
+      say "Disarmed." ;;
+    notify)
+      shift
+      if notify "$*"; then say "Sent."; else say "Failed — is NTFY_TOPIC set?"; exit 1; fi ;;
+    status)  cmd_status ;;
+    selftest) cmd_selftest ;;
+    logs)    tail -f "$LOG" ;;
+    version) say "$WAKEPILOT_VERSION" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+# Sourced by the test suite; executed everywhere else.
+[ "${WAKEPILOT_LIB:-0}" = "1" ] || main "$@"

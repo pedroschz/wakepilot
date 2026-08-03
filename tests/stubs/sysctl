@@ -1,0 +1,7 @@
+#!/bin/bash
+# Fake sysctl: kern.boottime, so tests can pretend the machine rebooted.
+if [ "${2:-}" = "kern.boottime" ] || [ "${1:-}" = "kern.boottime" ]; then
+  printf '{ sec = %s, usec = 0 } \n' \
+    "$(cat "$STUB_DIR/boottime" 2>/dev/null || echo $(( $(date +%s) - 86400 )))"
+fi
+exit 0
